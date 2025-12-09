@@ -1,184 +1,323 @@
 import os
 import json
+import base64
 import asyncio
 import logging
 
 from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
+from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 import websockets
 
-logging.basicConfig(level=logging.INFO)
+# ---------------------------------------------------------
+# Logging
+# ---------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+)
 logger = logging.getLogger("bookingbeaver")
 
+# ---------------------------------------------------------
+# Environment / config
+# ---------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_REALTIME_MODEL = os.getenv(
-    "OPENAI_REALTIME_MODEL",
-    "gpt-4o-realtime-preview-2024-12-17"
-)
-PUBLIC_HOST = os.getenv("PUBLIC_HOST")
-
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
+
+# Realtime model – override in Railway if needed
+OPENAI_REALTIME_MODEL = os.getenv(
+    "OPENAI_REALTIME_MODEL",
+    "gpt-4o-realtime-preview-2024-10-01",
+)
+
+PUBLIC_HOST = os.getenv("PUBLIC_HOST")  # e.g. bookingbeaver-server-production.up.railway.app
 if not PUBLIC_HOST:
-    raise RuntimeError("PUBLIC_HOST is not set")
+    raise RuntimeError("PUBLIC_HOST is not set (e.g. bookingbeaver-server-production.up.railway.app)")
+
+SYSTEM_MESSAGE = (
+    "You are a professional, concise AI phone receptionist for BookingBeaver. "
+    "You answer calls for small service businesses. "
+    "Greet callers politely, gather their name, phone number, and reason for calling, "
+    "and keep replies short and easy to understand over the phone. "
+    "Never say that you are an AI, and never mention internal tools, APIs, tokens, or system internals."
+)
+
+VOICE = "alloy"
+
+# Which OpenAI events to log verbosely
+LOG_EVENT_TYPES = [
+    "session.created",
+    "session.updated",
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
+    "response.created",
+    "response.content.done",
+    "response.audio.delta",
+    "response.done",
+    "rate_limits.updated",
+    "error",
+]
 
 app = FastAPI()
 
 
-# ---------- Twilio Voice webhook ----------
+# ---------------------------------------------------------
+# Helpers: OpenAI Realtime session config
+# ---------------------------------------------------------
+async def send_session_update(openai_ws):
+    """
+    Configure the Realtime session:
+    - g711_ulaw in/out (matches Twilio)
+    - server VAD
+    - voice + instructions
+    """
+    session_update = {
+        "type": "session.update",
+        "session": {
+            "model": OPENAI_REALTIME_MODEL,
+            "voice": VOICE,
+            "instructions": SYSTEM_MESSAGE,
+            "modalities": ["text", "audio"],
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "turn_detection": {
+                "type": "server_vad",
+                # Let server decide when you've stopped talking and respond
+                "silence_duration_ms": 600,
+            },
+        },
+    }
+    logger.info("Sending session.update to OpenAI")
+    await openai_ws.send(json.dumps(session_update))
 
+
+async def send_initial_greeting(openai_ws):
+    """
+    Optional: have the AI greet the caller first, without waiting for speech.
+    We do this by creating a conversation item + response.create.
+    """
+    item = {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": (
+                        "Greet the caller as the BookingBeaver receptionist. "
+                        "Briefly explain that you can help take messages or basic details "
+                        "for the business, then ask how you can help."
+                    ),
+                }
+            ],
+        },
+    }
+    await openai_ws.send(json.dumps(item))
+    await openai_ws.send(json.dumps({"type": "response.create"}))
+    logger.info("Sent initial greeting prompt to OpenAI")
+
+
+# ---------------------------------------------------------
+# 1) Twilio Voice webhook: incoming call
+# ---------------------------------------------------------
 @app.post("/twilio/voice")
 async def twilio_voice(request: Request):
-    """Twilio webhook for incoming calls."""
+    """
+    Twilio hits this when a call comes in.
+    We return TwiML that:
+    - Says a short line with Polly voice (Twilio TTS)
+    - Connects a Media Stream to /media-stream
+    """
+    logger.info("Incoming call from Twilio: %s", (await request.form()).get("From", "unknown"))
+
+    vr = VoiceResponse()
+    vr.say("Connecting you to our BookingBeaver AI receptionist.", voice="Polly.Joanna")
+
+    connect = Connect()
+    # Use PUBLIC_HOST for a stable, known hostname
     stream_url = f"wss://{PUBLIC_HOST}/media-stream"
-    logger.info(f"Incoming call -> starting media stream to {stream_url}")
+    connect.stream(url=stream_url)
+    vr.append(connect)
 
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna">Connecting you to our AI receptionist.</Say>
-    <Connect>
-        <Stream url="{stream_url}" />
-    </Connect>
-</Response>
-"""
-    return PlainTextResponse(content=twiml, media_type="text/xml")
+    logger.info("TwiML connect stream URL: %s", stream_url)
+    return PlainTextResponse(str(vr), media_type="application/xml")
 
 
-# ---------- OpenAI Realtime bridge ----------
-
-async def openai_session(websocket_twilio: WebSocket):
+# ---------------------------------------------------------
+# 2) WebSocket bridge: Twilio <-> OpenAI Realtime
+# ---------------------------------------------------------
+@app.websocket("/media-stream")
+async def media_stream(websocket: WebSocket):
     """
-    Bridge audio between Twilio Media Streams and OpenAI Realtime.
+    Twilio Media Streams WebSocket endpoint.
+    We:
+      - Accept Twilio WS
+      - Connect to OpenAI Realtime WS
+      - Pump audio Twilio -> OpenAI
+      - Pump audio deltas OpenAI -> Twilio
     """
-    uri = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1",
-    }
+    # Twilio recommends the 'audio.twilio.com' subprotocol, but it's not strictly required.
+    await websocket.accept(subprotocol="audio.twilio.com")
+    logger.info("Twilio Media Stream WebSocket connected")
 
-    logger.info("Connecting to OpenAI Realtime WebSocket...")
-    async with websockets.connect(uri, extra_headers=headers) as ws_openai:
+    openai_ws = None
+
+    try:
+        # Connect to OpenAI Realtime
+        realtime_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
+        logger.info("Connecting to OpenAI Realtime WebSocket: %s", realtime_url)
+
+        openai_ws = await websockets.connect(
+            realtime_url,
+            extra_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1",
+            },
+        )
         logger.info("Connected to OpenAI Realtime")
 
-        # Configure session: audio in, audio out, server VAD
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "model": OPENAI_REALTIME_MODEL,
-                # CRITICAL: tell it we want audio back
-                "modalities": ["audio"],
-                "voice": "alloy",
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "silence_duration_ms": 600,
-                    # Explicit: allow VAD to decide turns, but we also
-                    # send response.create manually on speech stop:
-                    "create_response": False,
-                },
-                "instructions": (
-                    "You are a professional, concise phone receptionist for BookingBeaver. "
-                    "Speak clearly, gather the caller's name, phone number, and reason for calling, "
-                    "and offer to schedule or take a message. Never mention that you are an AI "
-                    "or talk about internal tools or APIs."
-                ),
-            },
-        }
-        await ws_openai.send(json.dumps(session_update))
+        await send_session_update(openai_ws)
+        await send_initial_greeting(openai_ws)
 
-        twilio_stream_sid = None
+        stream_sid = None
+        latest_media_timestamp = 0  # for debugging timing if needed
 
-        async def twilio_to_openai():
-            nonlocal twilio_stream_sid
+        async def receive_from_twilio():
+            """
+            Read Twilio media events and forward audio to OpenAI.
+            """
+            nonlocal stream_sid, latest_media_timestamp
             try:
-                while True:
-                    msg = await websocket_twilio.receive_text()
-                    data = json.loads(msg)
-                    event_type = data.get("event")
-                    logger.info(f"From Twilio: {event_type}")
+                async for message in websocket.iter_text():
+                    data = json.loads(message)
+                    event = data.get("event")
+                    if event in ("start", "connected", "stop", "mark"):
+                        logger.info("From Twilio: %s -> %s", event, data)
+                    elif event == "media":
+                        # Audio packet
+                        latest_media_timestamp = int(data["media"].get("timestamp", 0))
+                        payload_b64 = data["media"]["payload"]  # base64-encoded g711_ulaw
 
-                    if event_type == "start":
-                        twilio_stream_sid = data["start"]["streamSid"]
-                        logger.info(f"Twilio stream started: {twilio_stream_sid}")
-
-                    elif event_type == "media":
-                        payload = data["media"]["payload"]
-                        await ws_openai.send(json.dumps({
+                        audio_append = {
                             "type": "input_audio_buffer.append",
-                            "audio": payload,
-                        }))
+                            "audio": payload_b64,
+                        }
+                        await openai_ws.send(json.dumps(audio_append))
+                    else:
+                        logger.info("From Twilio (other event): %s -> %s", event, data)
 
-                    elif event_type == "stop":
-                        logger.info("Twilio stream stopped")
+                    if event == "start":
+                        stream_sid = data["start"]["streamSid"]
+                        logger.info("Twilio stream started: %s", stream_sid)
+
+                    if event == "stop":
+                        logger.info("Twilio stream stopped event received")
                         break
 
             except Exception as e:
-                logger.warning(f"twilio_to_openai error: {e}")
+                logger.exception("Error in receive_from_twilio: %s", e)
+                # Close OpenAI if Twilio side dies
+                if openai_ws and openai_ws.open:
+                    await openai_ws.close()
 
-        async def openai_to_twilio():
-            nonlocal twilio_stream_sid
+        async def send_to_twilio():
+            """
+            Read OpenAI events and send audio deltas back to Twilio.
+            """
+            nonlocal stream_sid
             try:
-                async for raw in ws_openai:
-                    event = json.loads(raw)
+                async for raw in openai_ws:
+                    try:
+                        event = json.loads(raw)
+                    except Exception as decode_err:
+                        logger.error("Failed to decode OpenAI message: %s", decode_err)
+                        logger.debug("Raw message: %r", raw)
+                        continue
+
                     event_type = event.get("type")
-                    logger.info(f"From OpenAI: {event_type}")
 
-                    # When VAD says speech stopped, explicitly ask for a response
-                    if event_type == "input_audio_buffer.speech_stopped":
-                        logger.info("VAD: speech stopped -> sending response.create")
-                        await ws_openai.send(json.dumps({
-                            "type": "response.create"
-                        }))
+                    # Log key event types
+                    if event_type in LOG_EVENT_TYPES:
+                        logger.info("From OpenAI: %s -> %s", event_type, event)
 
-                    elif event_type == "response.audio.delta":
-                        if not twilio_stream_sid:
+                    # Full error logging
+                    if event_type == "error" or event.get("error"):
+                        logger.error("OpenAI error event: %s", json.dumps(event, indent=2))
+                        continue
+
+                    # When the model streams audio back
+                    if event_type == "response.audio.delta":
+                        if not stream_sid:
+                            logger.warning("Got audio.delta but no stream_sid yet")
                             continue
-                        chunk = event.get("delta")
-                        if not chunk:
+
+                        delta_b64 = event.get("delta")
+                        if not delta_b64:
                             continue
 
-                        frame = {
+                        # Twilio wants base64-encoded g711_ulaw audio in 'payload'
+                        audio_delta = {
                             "event": "media",
-                            "streamSid": twilio_stream_sid,
-                            "media": {"payload": chunk},
+                            "streamSid": stream_sid,
+                            "media": {
+                                "payload": delta_b64
+                            },
                         }
-                        await websocket_twilio.send_text(json.dumps(frame))
+                        await websocket.send_json(audio_delta)
+
+                    # If you want manual control, you could also watch:
+                    # - input_audio_buffer.speech_stopped -> send response.create
+                    # For now, we rely on server_vad + initial greeting.
 
             except Exception as e:
-                logger.warning(f"openai_to_twilio error: {e}")
+                logger.exception("Error in send_to_twilio: %s", e)
+                # Close Twilio WS if OpenAI side dies
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
 
-        t1 = asyncio.create_task(twilio_to_openai())
-        t2 = asyncio.create_task(openai_to_twilio())
+        # Run both directions until one fails/exits
+        await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
-        done, pending = await asyncio.wait(
-            {t1, t2},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-
-        logger.info("Closing OpenAI session bridge")
-
-
-# ---------- Twilio Media Stream WebSocket ----------
-
-@app.websocket("/media-stream")
-async def media_stream(websocket: WebSocket):
-    # Twilio Media Streams expect this subprotocol
-    await websocket.accept(subprotocol="audio.twilio.com")
-    logger.info("Twilio Media Stream WebSocket connected")
-    try:
-        await openai_session(websocket)
-    except Exception as e:
-        logger.error(f"media_stream error: {e}")
+    except Exception as outer_e:
+        logger.exception("Fatal error in media_stream handler: %s", outer_e)
     finally:
+        if openai_ws and openai_ws.open:
+            await openai_ws.close()
         logger.info("Closing Twilio Media Stream WebSocket")
-        await websocket.close()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
-# ---------- Health check ----------
-
+# ---------------------------------------------------------
+# Health + debug endpoints
+# ---------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "BookingBeaver AI Receptionist"}
+    return {
+        "status": "ok",
+        "service": "BookingBeaver AI Receptionist (Realtime)",
+        "model": OPENAI_REALTIME_MODEL,
+        "host": PUBLIC_HOST,
+    }
+
+
+@app.get("/debug/env")
+async def debug_env():
+    """
+    Quick sanity check endpoint for env config (no secrets).
+    """
+    return JSONResponse(
+        {
+            "OPENAI_API_KEY_set": bool(OPENAI_API_KEY),
+            "OPENAI_REALTIME_MODEL": OPENAI_REALTIME_MODEL,
+            "PUBLIC_HOST": PUBLIC_HOST,
+            "LOG_LEVEL": LOG_LEVEL,
+        }
+    )
