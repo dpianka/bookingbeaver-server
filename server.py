@@ -1,6 +1,5 @@
 import os
 import json
-import base64
 import asyncio
 import logging
 
@@ -26,10 +25,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 
-# Realtime model – override in Railway if needed
 OPENAI_REALTIME_MODEL = os.getenv(
     "OPENAI_REALTIME_MODEL",
-    "gpt-4o-realtime-preview-2024-10-01",
+    "gpt-4o-realtime-preview-2024-10-01",  # override in Railway if needed
 )
 
 PUBLIC_HOST = os.getenv("PUBLIC_HOST")  # e.g. bookingbeaver-server-production.up.railway.app
@@ -84,7 +82,6 @@ async def send_session_update(openai_ws):
             "output_audio_format": "g711_ulaw",
             "turn_detection": {
                 "type": "server_vad",
-                # Let server decide when you've stopped talking and respond
                 "silence_duration_ms": 600,
             },
         },
@@ -95,8 +92,7 @@ async def send_session_update(openai_ws):
 
 async def send_initial_greeting(openai_ws):
     """
-    Optional: have the AI greet the caller first, without waiting for speech.
-    We do this by creating a conversation item + response.create.
+    Have the AI greet the caller first.
     """
     item = {
         "type": "conversation.item.create",
@@ -131,13 +127,12 @@ async def twilio_voice(request: Request):
     - Says a short line with Polly voice (Twilio TTS)
     - Connects a Media Stream to /media-stream
     """
-    logger.info("Incoming call from Twilio: %s", (await request.form()).get("From", "unknown"))
+    logger.info("Incoming call from Twilio")
 
     vr = VoiceResponse()
     vr.say("Connecting you to our BookingBeaver AI receptionist.", voice="Polly.Joanna")
 
     connect = Connect()
-    # Use PUBLIC_HOST for a stable, known hostname
     stream_url = f"wss://{PUBLIC_HOST}/media-stream"
     connect.stream(url=stream_url)
     vr.append(connect)
@@ -159,7 +154,6 @@ async def media_stream(websocket: WebSocket):
       - Pump audio Twilio -> OpenAI
       - Pump audio deltas OpenAI -> Twilio
     """
-    # Twilio recommends the 'audio.twilio.com' subprotocol, but it's not strictly required.
     await websocket.accept(subprotocol="audio.twilio.com")
     logger.info("Twilio Media Stream WebSocket connected")
 
@@ -183,23 +177,18 @@ async def media_stream(websocket: WebSocket):
         await send_initial_greeting(openai_ws)
 
         stream_sid = None
-        latest_media_timestamp = 0  # for debugging timing if needed
 
         async def receive_from_twilio():
-            """
-            Read Twilio media events and forward audio to OpenAI.
-            """
-            nonlocal stream_sid, latest_media_timestamp
+            nonlocal stream_sid
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
                     event = data.get("event")
+
                     if event in ("start", "connected", "stop", "mark"):
                         logger.info("From Twilio: %s -> %s", event, data)
                     elif event == "media":
-                        # Audio packet
-                        latest_media_timestamp = int(data["media"].get("timestamp", 0))
-                        payload_b64 = data["media"]["payload"]  # base64-encoded g711_ulaw
+                        payload_b64 = data["media"]["payload"]  # base64 g711_ulaw
 
                         audio_append = {
                             "type": "input_audio_buffer.append",
@@ -219,14 +208,10 @@ async def media_stream(websocket: WebSocket):
 
             except Exception as e:
                 logger.exception("Error in receive_from_twilio: %s", e)
-                # Close OpenAI if Twilio side dies
                 if openai_ws and openai_ws.open:
                     await openai_ws.close()
 
         async def send_to_twilio():
-            """
-            Read OpenAI events and send audio deltas back to Twilio.
-            """
             nonlocal stream_sid
             try:
                 async for raw in openai_ws:
@@ -239,16 +224,13 @@ async def media_stream(websocket: WebSocket):
 
                     event_type = event.get("type")
 
-                    # Log key event types
                     if event_type in LOG_EVENT_TYPES:
                         logger.info("From OpenAI: %s -> %s", event_type, event)
 
-                    # Full error logging
                     if event_type == "error" or event.get("error"):
                         logger.error("OpenAI error event: %s", json.dumps(event, indent=2))
                         continue
 
-                    # When the model streams audio back
                     if event_type == "response.audio.delta":
                         if not stream_sid:
                             logger.warning("Got audio.delta but no stream_sid yet")
@@ -258,29 +240,20 @@ async def media_stream(websocket: WebSocket):
                         if not delta_b64:
                             continue
 
-                        # Twilio wants base64-encoded g711_ulaw audio in 'payload'
                         audio_delta = {
                             "event": "media",
                             "streamSid": stream_sid,
-                            "media": {
-                                "payload": delta_b64
-                            },
+                            "media": {"payload": delta_b64},
                         }
                         await websocket.send_json(audio_delta)
 
-                    # If you want manual control, you could also watch:
-                    # - input_audio_buffer.speech_stopped -> send response.create
-                    # For now, we rely on server_vad + initial greeting.
-
             except Exception as e:
                 logger.exception("Error in send_to_twilio: %s", e)
-                # Close Twilio WS if OpenAI side dies
                 try:
                     await websocket.close()
                 except Exception:
                     pass
 
-        # Run both directions until one fails/exits
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
     except Exception as outer_e:
