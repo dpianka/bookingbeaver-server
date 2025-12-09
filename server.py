@@ -11,7 +11,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bookingbeaver")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17")
+OPENAI_REALTIME_MODEL = os.getenv(
+    "OPENAI_REALTIME_MODEL",
+    "gpt-4o-realtime-preview-2024-12-17"
+)
 PUBLIC_HOST = os.getenv("PUBLIC_HOST")
 
 if not OPENAI_API_KEY:
@@ -21,6 +24,8 @@ if not PUBLIC_HOST:
 
 app = FastAPI()
 
+
+# ---------- Twilio Voice webhook ----------
 
 @app.post("/twilio/voice")
 async def twilio_voice(request: Request):
@@ -39,8 +44,12 @@ async def twilio_voice(request: Request):
     return PlainTextResponse(content=twiml, media_type="text/xml")
 
 
+# ---------- OpenAI Realtime bridge ----------
+
 async def openai_session(websocket_twilio: WebSocket):
-    """Bridge audio between Twilio Media Streams and OpenAI Realtime."""
+    """
+    Bridge audio between Twilio Media Streams and OpenAI Realtime.
+    """
     uri = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -51,21 +60,28 @@ async def openai_session(websocket_twilio: WebSocket):
     async with websockets.connect(uri, extra_headers=headers) as ws_openai:
         logger.info("Connected to OpenAI Realtime")
 
+        # Configure session: audio in, audio out, server VAD
         session_update = {
             "type": "session.update",
             "session": {
                 "model": OPENAI_REALTIME_MODEL,
+                # CRITICAL: tell it we want audio back
+                "modalities": ["audio"],
                 "voice": "alloy",
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 600,
+                    # Explicit: allow VAD to decide turns, but we also
+                    # send response.create manually on speech stop:
+                    "create_response": False,
                 },
                 "instructions": (
-                    "You are a professional, concise business phone receptionist for BookingBeaver. "
+                    "You are a professional, concise phone receptionist for BookingBeaver. "
                     "Speak clearly, gather the caller's name, phone number, and reason for calling, "
-                    "and stay focused on helping them. Never mention that you are an AI."
+                    "and offer to schedule or take a message. Never mention that you are an AI "
+                    "or talk about internal tools or APIs."
                 ),
             },
         }
@@ -108,7 +124,14 @@ async def openai_session(websocket_twilio: WebSocket):
                     event_type = event.get("type")
                     logger.info(f"From OpenAI: {event_type}")
 
-                    if event_type == "response.audio.delta":
+                    # When VAD says speech stopped, explicitly ask for a response
+                    if event_type == "input_audio_buffer.speech_stopped":
+                        logger.info("VAD: speech stopped -> sending response.create")
+                        await ws_openai.send(json.dumps({
+                            "type": "response.create"
+                        }))
+
+                    elif event_type == "response.audio.delta":
                         if not twilio_stream_sid:
                             continue
                         chunk = event.get("delta")
@@ -138,6 +161,8 @@ async def openai_session(websocket_twilio: WebSocket):
         logger.info("Closing OpenAI session bridge")
 
 
+# ---------- Twilio Media Stream WebSocket ----------
+
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     # Twilio Media Streams expect this subprotocol
@@ -151,6 +176,8 @@ async def media_stream(websocket: WebSocket):
         logger.info("Closing Twilio Media Stream WebSocket")
         await websocket.close()
 
+
+# ---------- Health check ----------
 
 @app.get("/")
 async def root():
