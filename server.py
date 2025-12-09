@@ -1,64 +1,141 @@
 import os
 import json
-import base64
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import JSONResponse, Response
+from typing import List, Dict, Optional, Tuple
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
+from fastapi.responses import JSONResponse, Response, PlainTextResponse
+from fastapi.encoders import jsonable_encoder
+
 from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 
 import websockets
+from websockets.exceptions import ConnectionClosed
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ---------------------------------------------------------
+# =========================================================
 # Logging
-# ---------------------------------------------------------
-logger = logging.getLogger("bookingbeaver")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-logger.addHandler(handler)
+# =========================================================
 
-# ---------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+)
+logger = logging.getLogger("bookingbeaver")
+
+# =========================================================
 # Environment / Config
-# ---------------------------------------------------------
+# =========================================================
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY must be set")
 
-OPENAI_REALTIME_MODEL = os.getenv(
-    "OPENAI_REALTIME_MODEL",
-    "gpt-4o-realtime-preview-2024-12-17"  # this is what you already used
-)
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 
-# Google Calendar
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-TIMEZONE = os.getenv("TIMEZONE", "America/New_York")
+PUBLIC_HOST = os.getenv("PUBLIC_HOST")  # e.g. bookingbeaver-server-production.up.railway.app
+if not PUBLIC_HOST:
+    raise RuntimeError("PUBLIC_HOST must be set (Railway domain, without protocol)")
+
+BUSINESS_NAME = os.getenv("BUSINESS_NAME", "BookingBeaver")
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")
+
+# Google Calendar config
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "")
+TIMEZONE_STR = os.getenv("TIMEZONE", "America/New_York")
+
+# Booking window config
+BOOKING_SLOT_MINUTES = int(os.getenv("BOOKING_SLOT_MINUTES", "15"))
+BOOKING_WORK_START_HOUR = int(os.getenv("BOOKING_WORK_START_HOUR", "9"))    # 09:00
+BOOKING_WORK_END_HOUR = int(os.getenv("BOOKING_WORK_END_HOUR", "17"))      # 17:00
+BOOKING_LOOKAHEAD_DAYS = int(os.getenv("BOOKING_LOOKAHEAD_DAYS", "7"))
 
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+# Local timezone (for computations)
+LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
+
 calendar_service = None  # initialized on startup
 
-# Simple in-memory lead store (can be replaced with DB later)
-LEADS = []
+# In-memory lead store (placeholder)
+LEADS: List[Dict] = []
 
-# ---------------------------------------------------------
+# =========================================================
+# System message for the receptionist
+# =========================================================
+
+SYSTEM_INSTRUCTIONS = f"""
+You are a professional, concise phone receptionist for {BUSINESS_NAME}.
+
+Your job:
+- Greet callers briefly as the receptionist for {BUSINESS_NAME}.
+- Ask how you can help.
+- If they are interested in BookingBeaver or want to talk to a specialist:
+  - Explain that BookingBeaver is an AI answering and booking assistant that:
+    • answers their calls 24/7,
+    • answers common questions,
+    • captures caller details,
+    • and can integrate with their calendar so appointments are scheduled automatically.
+  - Offer to schedule a short consultation.
+  - Ask for:
+    • Full name
+    • Best callback phone number
+    • Business name
+  - Confirm those back in one short sentence.
+
+- If they are just curious, still try to collect:
+  • Name
+  • Phone number
+  • Business name
+
+- If they ask “What can BookingBeaver provide?”:
+  - Explain in 1–2 concrete examples what it does (answer calls, capture leads, integrate with calendar, etc.).
+
+Rules:
+- Keep replies short, 1–3 simple sentences.
+- Never say you are an AI, a model, or mention prompts, tokens, APIs, or tools.
+- Do not mention calendar APIs or Google or internal systems.
+- If the caller goes quiet, gently prompt once, then end politely if silence continues.
+
+At the end of the conversation, summarize what you captured (name, phone, business) in one short spoken sentence.
+"""
+
+# Events from OpenAI worth logging verbosely
+OPENAI_LOG_EVENTS = {
+    "session.created",
+    "session.updated",
+    "input_audio_buffer.speech_started",
+    "input_audio_buffer.speech_stopped",
+    "response.created",
+    "response.done",
+    "response.audio.delta",
+    "error",
+}
+
+# =========================================================
 # Google Calendar helpers
-# ---------------------------------------------------------
+# =========================================================
+
+
 def _init_calendar_service():
     global calendar_service
     if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_CALENDAR_ID:
-        logger.warning("Google Calendar not fully configured (missing env vars).")
+        logger.warning("Google Calendar not fully configured (missing JSON or CALENDAR_ID).")
         calendar_service = None
         return
 
     try:
-        sa_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=GOOGLE_SCOPES)
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=GOOGLE_SCOPES
+        )
         calendar_service = build("calendar", "v3", credentials=creds)
         logger.info("Google Calendar service initialized.")
     except Exception as e:
@@ -66,90 +143,42 @@ def _init_calendar_service():
         calendar_service = None
 
 
-def find_next_free_slot(duration_minutes: int = 15) -> tuple[datetime, datetime] | None:
-    """
-    Very simple availability check:
-    - Look 2 hours ahead from now
-    - Book the first free 15-minute block today
-    """
-    if not calendar_service:
-        logger.warning("find_next_free_slot called but calendar_service is None.")
-        return None
-
-    now = datetime.utcnow()
-    end_of_window = now + timedelta(hours=8)
-
-    events_result = (
-        calendar_service.events()
-        .list(
-            calendarId=GOOGLE_CALENDAR_ID,
-            timeMin=now.isoformat() + "Z",
-            timeMax=end_of_window.isoformat() + "Z",
-            singleEvents=True,
-            orderBy="startTime",
-        )
-        .execute()
-    )
-    events = events_result.get("items", [])
-
-    # Start searching from 2 hours from now, on 15-min grid
-    cursor = now + timedelta(hours=2)
-    cursor = cursor.replace(second=0, microsecond=0, minute=(cursor.minute // 15) * 15)
-
-    while cursor < end_of_window:
-        slot_end = cursor + timedelta(minutes=duration_minutes)
-
-        conflict = False
-        for event in events:
-            start_str = event["start"].get("dateTime")
-            end_str = event["end"].get("dateTime")
-            if not start_str or not end_str:
-                continue
-            start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-            end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-
-            # Overlap?
-            if not (slot_end <= start or cursor >= end):
-                conflict = True
-                break
-
-        if not conflict:
-            return cursor, slot_end
-
-        cursor += timedelta(minutes=15)
-
-    return None
+def get_calendar_service():
+    if calendar_service is None:
+        logger.warning("Calendar service is not initialized or failed previously.")
+    return calendar_service
 
 
 def create_calendar_event(
-    title: str,
-    description: str,
-    start: datetime,
-    end: datetime,
-) -> dict | None:
-    if not calendar_service:
-        logger.warning("create_calendar_event called but calendar_service is None.")
+    summary: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    description: str = "",
+) -> Optional[Dict]:
+    service = get_calendar_service()
+    if not service:
+        logger.warning("create_calendar_event: calendar service is None.")
         return None
 
-    event_body = {
-        "summary": title,
+    body = {
+        "summary": summary,
         "description": description,
         "start": {
-            "dateTime": start.isoformat(),
-            "timeZone": TIMEZONE,
+            "dateTime": start_dt.isoformat(),
+            "timeZone": TIMEZONE_STR,
         },
         "end": {
-            "dateTime": end.isoformat(),
-            "timeZone": TIMEZONE,
+            "dateTime": end_dt.isoformat(),
+            "timeZone": TIMEZONE_STR,
         },
     }
 
     try:
-        event = (
-            calendar_service.events()
-            .insert(calendarId=GOOGLE_CALENDAR_ID, body=event_body)
-            .execute()
-        )
+        event = service.events().insert(
+            calendarId=GOOGLE_CALENDAR_ID,
+            body=body,
+            sendUpdates="none",
+        ).execute()
         logger.info("Created calendar event: %s", event.get("id"))
         return event
     except Exception as e:
@@ -157,136 +186,285 @@ def create_calendar_event(
         return None
 
 
-# ---------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------
+def get_free_slots_for_date(
+    target_date: date,
+    slot_minutes: int = BOOKING_SLOT_MINUTES,
+    max_slots: int = 5,
+) -> List[Dict]:
+    """
+    Return up to `max_slots` free appointment slots for the given date.
+
+    Each slot is { "start": ISO8601, "end": ISO8601 } in LOCAL_TZ.
+    """
+    service = get_calendar_service()
+    if not service:
+        logger.warning("get_free_slots_for_date: calendar service is None.")
+        return []
+
+    day_start = datetime(
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+        hour=BOOKING_WORK_START_HOUR,
+        minute=0,
+        second=0,
+        tzinfo=LOCAL_TZ,
+    )
+    day_end = datetime(
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+        hour=BOOKING_WORK_END_HOUR,
+        minute=0,
+        second=0,
+        tzinfo=LOCAL_TZ,
+    )
+
+    body = {
+        "timeMin": day_start.isoformat(),
+        "timeMax": day_end.isoformat(),
+        "items": [{"id": GOOGLE_CALENDAR_ID}],
+    }
+
+    try:
+        fb = service.freebusy().query(body=body).execute()
+        busy_list = fb["calendars"][GOOGLE_CALENDAR_ID]["busy"]
+    except Exception as e:
+        logger.exception("Error calling freeBusy: %s", e)
+        return []
+
+    busy_intervals: List[Tuple[datetime, datetime]] = []
+    for b in busy_list:
+        bs = datetime.fromisoformat(b["start"].replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+        be = datetime.fromisoformat(b["end"].replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+        busy_intervals.append((bs, be))
+
+    busy_intervals.sort(key=lambda x: x[0])
+
+    free_intervals: List[Tuple[datetime, datetime]] = []
+    cursor = day_start
+
+    for bs, be in busy_intervals:
+        if be <= day_start or bs >= day_end:
+            continue
+
+        bs_clamped = max(bs, day_start)
+        be_clamped = min(be, day_end)
+
+        if bs_clamped > cursor:
+            free_intervals.append((cursor, bs_clamped))
+
+        cursor = max(cursor, be_clamped)
+
+    if cursor < day_end:
+        free_intervals.append((cursor, day_end))
+
+    slots: List[Dict] = []
+    slot_delta = timedelta(minutes=slot_minutes)
+
+    for fs, fe in free_intervals:
+        slot_start = fs
+        while slot_start + slot_delta <= fe and len(slots) < max_slots:
+            slot_end = slot_start + slot_delta
+            slots.append(
+                {
+                    "start": slot_start.isoformat(),
+                    "end": slot_end.isoformat(),
+                }
+            )
+            slot_start = slot_end
+        if len(slots) >= max_slots:
+            break
+
+    logger.info("Computed %d free slots for %s", len(slots), target_date.isoformat())
+    return slots
+
+
+def find_next_free_slot(duration_minutes: int = BOOKING_SLOT_MINUTES) -> Optional[Tuple[datetime, datetime]]:
+    """
+    Simple helper: look ahead BOOKING_LOOKAHEAD_DAYS from now and return
+    the earliest free slot that fits `duration_minutes`.
+    """
+    now = datetime.now(LOCAL_TZ)
+    for day_offset in range(BOOKING_LOOKAHEAD_DAYS + 1):
+        d = (now + timedelta(days=day_offset)).date()
+        slots = get_free_slots_for_date(d, duration_minutes, max_slots=100)
+        for s in slots:
+            start = datetime.fromisoformat(s["start"])
+            end = datetime.fromisoformat(s["end"])
+            if start >= now:
+                return start, end
+    return None
+
+
+# =========================================================
+# OpenAI Realtime helpers
+# =========================================================
+
+async def configure_openai_session(openai_ws):
+    """
+    Send session.update and initial greeting to OpenAI Realtime.
+    """
+    session_update = {
+        "type": "session.update",
+        "session": {
+            "model": OPENAI_REALTIME_MODEL,
+            "modalities": ["audio", "text"],
+            "voice": OPENAI_VOICE,
+            "instructions": SYSTEM_INSTRUCTIONS.strip(),
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 600,
+                "create_response": True,
+                "interrupt_response": True,
+            },
+        },
+    }
+
+    await openai_ws.send(json.dumps(session_update))
+    logger.info("Sent session.update to OpenAI")
+
+    # Kick off with a greeting
+    await openai_ws.send(
+        json.dumps(
+            {
+                "type": "response.create",
+                "response": {
+                    "instructions": (
+                        f"Start the call by briefly introducing yourself as the "
+                        f"receptionist for {BUSINESS_NAME} and ask how you can help."
+                    )
+                },
+            }
+        )
+    )
+    logger.info("Sent initial greeting request to OpenAI")
+
+
+# =========================================================
+# FastAPI App
+# =========================================================
+
 app = FastAPI()
 
 
 @app.on_event("startup")
-async def startup_event():
+async def on_startup():
     _init_calendar_service()
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "BookingBeaver AI Receptionist"}
+    return {
+        "status": "ok",
+        "service": "BookingBeaver AI Receptionist",
+        "model": OPENAI_REALTIME_MODEL,
+        "host": PUBLIC_HOST,
+        "business": BUSINESS_NAME,
+        "voice": OPENAI_VOICE,
+    }
 
 
-# ---------------------------------------------------------
+@app.get("/debug/env")
+async def debug_env():
+    return {
+        "OPENAI_API_KEY_set": bool(OPENAI_API_KEY),
+        "OPENAI_REALTIME_MODEL": OPENAI_REALTIME_MODEL,
+        "PUBLIC_HOST": PUBLIC_HOST,
+        "BUSINESS_NAME": BUSINESS_NAME,
+        "VOICE": OPENAI_VOICE,
+        "LOG_LEVEL": LOG_LEVEL,
+        "GOOGLE_CALENDAR_CONFIGURED": bool(GOOGLE_SERVICE_ACCOUNT_JSON and GOOGLE_CALENDAR_ID),
+        "GOOGLE_CALENDAR_ID": GOOGLE_CALENDAR_ID,
+        "TIMEZONE": TIMEZONE_STR,
+        "BOOKING_SLOT_MINUTES": BOOKING_SLOT_MINUTES,
+        "BOOKING_WORK_START_HOUR": BOOKING_WORK_START_HOUR,
+        "BOOKING_WORK_END_HOUR": BOOKING_WORK_END_HOUR,
+        "BOOKING_LOOKAHEAD_DAYS": BOOKING_LOOKAHEAD_DAYS,
+    }
+
+
+# =========================================================
 # Twilio Voice Webhook
-# ---------------------------------------------------------
+# =========================================================
+
 @app.post("/twilio/voice")
 async def twilio_voice(request: Request):
-    """Webhook for incoming Twilio calls."""
+    """
+    Twilio webhook: returns TwiML that starts a Media Stream to /media-stream.
+    """
     form = await request.form()
     from_number = form.get("From", "unknown")
-    logger.info("Incoming call from Twilio: %s", from_number)
+    to_number = form.get("To", "unknown")
+    call_sid = form.get("CallSid", "unknown")
 
-    # Figure out our public host to build wss:// URL
-    host = request.headers.get("x-forwarded-host") or request.url.hostname
-    if not host:
-        raise RuntimeError("Cannot determine host for Twilio stream URL")
+    logger.info(
+        "Incoming call from Twilio: from=%s to=%s call_sid=%s",
+        from_number,
+        to_number,
+        call_sid,
+    )
 
-    stream_url = f"wss://{host}/media-stream"
+    stream_url = f"wss://{PUBLIC_HOST}/media-stream"
     logger.info("TwiML connect stream URL: %s", stream_url)
 
-    response = VoiceResponse()
-    response.say(
-        "Connecting you to our AI receptionist.",
+    vr = VoiceResponse()
+    vr.say(
+        f"Connecting you to the {BUSINESS_NAME} receptionist.",
         voice="Polly.Joanna",
     )
 
     connect = Connect()
     connect.append(Stream(url=stream_url))
-    response.append(connect)
+    vr.append(connect)
 
-    return Response(content=str(response), media_type="application/xml")
+    return Response(content=str(vr), media_type="application/xml")
 
 
-# ---------------------------------------------------------
-# WebSocket bridge: Twilio Media Streams <-> OpenAI Realtime
-# ---------------------------------------------------------
-async def openai_session(websocket_twilio: WebSocket):
+# =========================================================
+# WebSocket Bridge: Twilio <-> OpenAI Realtime
+# =========================================================
+
+async def openai_session_bridge(websocket_twilio: WebSocket):
     """
-    Bridge audio between Twilio Media Streams and OpenAI Realtime.
+    Bridge audio between Twilio Media Streams WebSocket and OpenAI Realtime WebSocket.
     """
-    uri = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
-
+    realtime_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
     }
 
-    logger.info("Connecting to OpenAI Realtime WebSocket: %s", uri)
+    logger.info("Connecting to OpenAI Realtime at %s", realtime_url)
 
-    async with websockets.connect(uri, extra_headers=headers) as websocket_openai:
+    async with websockets.connect(realtime_url, extra_headers=headers) as websocket_openai:
         logger.info("Connected to OpenAI Realtime")
 
-        # Configure the session so audio formats match Twilio (G.711 µ-law)
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "model": OPENAI_REALTIME_MODEL,
-                "modalities": ["audio", "text"],
-                "voice": "alloy",
-                "instructions": (
-                    "You are a professional, concise phone receptionist for BookingBeaver. "
-                    "You answer calls for small service businesses, greet politely, "
-                    "gather the caller's name, phone number, and business name, and "
-                    "keep replies short and easy to understand over the phone. "
-                    "Never say that you are an AI, and never mention internal tools, APIs, "
-                    "tokens, or system internals."
-                ),
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 600,
-                    "create_response": True,
-                    "interrupt_response": True,
-                },
-            },
-        }
+        await configure_openai_session(websocket_openai)
 
-        await websocket_openai.send(json.dumps(session_update))
-        logger.info("Sending session.update to OpenAI")
+        stream_sid: Optional[str] = None
 
-        # Optional: have the assistant start with a greeting immediately
-        await websocket_openai.send(
-            json.dumps(
-                {
-                    "type": "response.create",
-                    "response": {
-                        "instructions": (
-                            "Start the call by briefly introducing yourself as "
-                            "the receptionist for BookingBeaver and ask how you can help."
-                        )
-                    },
-                }
-            )
-        )
-        logger.info("Sent initial greeting prompt to OpenAI")
-
-        stream_sid = None
-
-        async def twilio_to_openai():
+        async def from_twilio_to_openai():
             nonlocal stream_sid
             try:
                 while True:
                     msg_text = await websocket_twilio.receive_text()
                     msg = json.loads(msg_text)
-                    event_type = msg.get("event")
-                    logger.info("From Twilio: %s -> %s", event_type, msg)
+                    event = msg.get("event")
 
-                    if event_type == "start":
-                        stream_sid = msg["start"]["streamSid"]
+                    if event != "media":
+                        logger.info("From Twilio: %s -> %s", event, msg)
+
+                    if event == "start":
+                        start_info = msg.get("start", {})
+                        stream_sid = start_info.get("streamSid")
                         logger.info("Twilio stream started: %s", stream_sid)
 
-                    elif event_type == "media":
-                        # Forward audio from Twilio to OpenAI
+                    elif event == "media":
                         audio_b64 = msg["media"]["payload"]
                         await websocket_openai.send(
                             json.dumps(
@@ -297,81 +475,105 @@ async def openai_session(websocket_twilio: WebSocket):
                             )
                         )
 
-                    elif event_type == "stop":
+                    elif event == "stop":
                         logger.info("Twilio stream stopped event received")
-                        # Commit remaining audio buffer
+                        # Commit whatever is in the buffer
                         await websocket_openai.send(
                             json.dumps({"type": "input_audio_buffer.commit"})
                         )
                         break
+
             except WebSocketDisconnect:
                 logger.info("Twilio WebSocket disconnected")
             except Exception as e:
-                logger.exception("Error in twilio_to_openai: %s", e)
+                logger.exception("Error in from_twilio_to_openai: %s", e)
 
-        async def openai_to_twilio():
+        async def from_openai_to_twilio():
+            nonlocal stream_sid
             try:
-                async for message in websocket_openai:
-                    evt = json.loads(message)
-                    evt_type = evt.get("type")
-                    logger.info("From OpenAI: %s -> %s", evt_type, evt)
+                async for raw in websocket_openai:
+                    try:
+                        evt = json.loads(raw)
+                    except Exception as decode_err:
+                        logger.error("Failed to decode OpenAI message: %s", decode_err)
+                        logger.debug("Raw message: %r", raw)
+                        continue
 
-                    # Stream audio chunks back to Twilio
-                    if evt_type == "response.output_audio.delta":
+                    evt_type = evt.get("type")
+
+                    if evt_type in OPENAI_LOG_EVENTS:
+                        logger.info("From OpenAI: %s -> %s", evt_type, evt)
+
+                    if evt_type == "error" or evt.get("error"):
+                        logger.error("OpenAI error event: %s", json.dumps(evt))
+                        continue
+
+                    if evt_type == "response.audio.delta":
                         if not stream_sid:
-                            # We can't send audio before Twilio 'start'
+                            logger.warning("Received audio.delta before stream_sid is set")
                             continue
-                        audio_b64 = evt["delta"]
+                        delta_b64 = evt.get("delta")
+                        if not delta_b64:
+                            continue
+
                         twilio_msg = {
                             "event": "media",
                             "streamSid": stream_sid,
-                            "media": {"payload": audio_b64},
+                            "media": {
+                                "payload": delta_b64,
+                            },
                         }
                         await websocket_twilio.send_text(json.dumps(twilio_msg))
 
-                    # You can expand this branch later to parse text, tools, etc.
+            except ConnectionClosed:
+                logger.warning("OpenAI websocket closed")
             except Exception as e:
-                logger.exception("Error in openai_to_twilio: %s", e)
+                logger.exception("Error in from_openai_to_twilio: %s", e)
 
-        await asyncio.gather(twilio_to_openai(), openai_to_twilio())
-
-        logger.info("Closing OpenAI session bridge")
+        await asyncio.gather(from_twilio_to_openai(), from_openai_to_twilio())
+        logger.info("OpenAI session bridge finished")
 
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """
-    Twilio will connect here for Media Streams.
+    Twilio Media Streams connects here.
     """
     await websocket.accept()
     logger.info("Twilio Media Stream WebSocket connected")
     try:
-        await openai_session(websocket)
+        await openai_session_bridge(websocket)
     finally:
         logger.info("Closing Twilio Media Stream WebSocket")
-        await websocket.close()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
-# ---------------------------------------------------------
-# Lead + Calendar debug endpoints
-# (These are for you, not Twilio. They won't be called from phone.)
-# ---------------------------------------------------------
+# =========================================================
+# Debug / Lead endpoints
+# =========================================================
+
 @app.get("/debug/calendar")
 async def debug_calendar():
-    """Quick check that Calendar is wired correctly."""
-    if not calendar_service:
+    """
+    Return some upcoming events to confirm calendar access works.
+    """
+    service = get_calendar_service()
+    if not service:
         return JSONResponse(
-            {"ok": False, "error": "Calendar not configured or failed to initialize"},
             status_code=500,
+            content={"ok": False, "error": "calendar_not_configured"},
         )
 
     try:
-        now = datetime.utcnow()
+        now = datetime.now(LOCAL_TZ)
         events_result = (
-            calendar_service.events()
+            service.events()
             .list(
                 calendarId=GOOGLE_CALENDAR_ID,
-                timeMin=now.isoformat() + "Z",
+                timeMin=now.isoformat(),
                 maxResults=5,
                 singleEvents=True,
                 orderBy="startTime",
@@ -382,36 +584,95 @@ async def debug_calendar():
         return {"ok": True, "sample_events": events}
     except Exception as e:
         logger.exception("Error in /debug/calendar: %s", e)
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-
-@app.post("/debug/book-test")
-async def debug_book_test():
-    """Manually create a 15-minute test event to verify bookings work."""
-    slot = find_next_free_slot(15)
-    if not slot:
         return JSONResponse(
-            {"ok": False, "error": "No free slot found in window"},
-            status_code=400,
-        )
-
-    start, end = slot
-    event = create_calendar_event(
-        "Test BookingBeaver AI appointment",
-        "Created by /debug/book-test",
-        start,
-        end,
-    )
-    if not event:
-        return JSONResponse(
-            {"ok": False, "error": "Failed to create event"},
             status_code=500,
+            content={"ok": False, "error": "calendar_error", "detail": str(e)},
         )
 
-    return {"ok": True, "event": event}
+
+@app.api_route("/debug/book-test", methods=["GET", "POST"])
+async def debug_book_test():
+    """
+    Create a 15-minute test event using the next free slot.
+    """
+    try:
+        slot = find_next_free_slot(BOOKING_SLOT_MINUTES)
+        if not slot:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "no_free_slot"},
+            )
+
+        start, end = slot
+        event = create_calendar_event(
+            summary="Test BookingBeaver AI appointment",
+            start_dt=start,
+            end_dt=end,
+            description="Debug test booking via /debug/book-test",
+        )
+        if not event:
+            return JSONResponse(
+                status_code=500,
+                content={"ok": False, "error": "event_create_failed"},
+            )
+
+        safe_event = jsonable_encoder(
+            {
+                "id": event.get("id"),
+                "summary": event.get("summary"),
+                "start": event.get("start"),
+                "end": event.get("end"),
+                "htmlLink": event.get("htmlLink"),
+            }
+        )
+        return {"ok": True, "event": safe_event}
+
+    except Exception as e:
+        logger.exception("Error in /debug/book-test: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "debug_book_test_failed", "detail": str(e)},
+        )
+
+
+@app.get("/debug/free-slots")
+async def debug_free_slots(
+    dt_str: Optional[str] = Query(default=None, description="YYYY-MM-DD (optional)"),
+    max_slots: int = Query(default=5, ge=1, le=50),
+):
+    """
+    Return free slots for a given date (or today if not provided).
+    """
+    try:
+        if dt_str:
+            target_date = date.fromisoformat(dt_str)
+        else:
+            target_date = datetime.now(LOCAL_TZ).date()
+
+        slots = get_free_slots_for_date(
+            target_date=target_date,
+            slot_minutes=BOOKING_SLOT_MINUTES,
+            max_slots=max_slots,
+        )
+        return {
+            "ok": True,
+            "date": target_date.isoformat(),
+            "slot_minutes": BOOKING_SLOT_MINUTES,
+            "slots": slots,
+        }
+    except Exception as e:
+        logger.exception("Error in /debug/free-slots: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "debug_free_slots_failed", "detail": str(e)},
+        )
 
 
 @app.get("/leads")
 async def list_leads():
-    """Placeholder lead warehouse endpoint."""
-    return {"count": len(LEADS), "items": LEADS}
+    """
+    Placeholder lead inbox endpoint.
+    Currently not populated by the AI, but ready for when we
+    start parsing transcripts or tool calls.
+    """
+    return {"count": len(LEADS), "leads": LEADS}
