@@ -52,9 +52,9 @@ TIMEZONE_STR = os.getenv("TIMEZONE", "America/New_York")
 
 # Booking parameters
 BOOKING_SLOT_MINUTES = int(os.getenv("BOOKING_SLOT_MINUTES", "15"))
-BOOKING_WORK_START_HOUR = int(os.getenv("BOOKING_WORK_START_HOUR", "9"))
-BOOKING_WORK_END_HOUR = int(os.getenv("BOOKING_WORK_END_HOUR", "17"))
-BOOKING_LOOKAHEAD_DAYS = int(os.getenv("BOOKING_LOOKAHEAD_DAYS", "7"))
+BOOKING_WORK_START_HOUR = int(os.getenv("BOOKING_WORK_START_HOUR", "7"))
+BOOKING_WORK_END_HOUR = int(os.getenv("BOOKING_WORK_END_HOUR", "20"))
+BOOKING_LOOKAHEAD_DAYS = int(os.getenv("BOOKING_LOOKAHEAD_DAYS", "12"))
 
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
